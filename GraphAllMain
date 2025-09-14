@@ -1,0 +1,287 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import serial
+import serial.tools.list_ports
+import threading
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.widgets import Button
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import folium
+import os
+import webbrowser
+from tkinter import filedialog
+from stl import mesh
+
+# ---------------- GUI Setup ----------------
+root = tk.Tk()
+root.title("LOCKET PANEL")
+root.geometry("1700x1300")
+root.configure(bg="white")   # or any color name / hex code like "#1e1e1e"
+
+
+# ---------------- Telemetry Fields ----------------
+fields = ["Yaw","Pitch","Roll","Temp","Humidity","Pressure","Altitude","Latitude","Longitude","RSSI"]
+graph_fields = ["Yaw","Pitch","Roll","Temp","Altitude","Pressure","RSSI"]
+labels = {}
+plot_data = {f: [] for f in graph_fields}
+time_data = []
+
+# --- COM Port Selector ---
+tk.Label(root, text="Select COM Port:", font=("Arial", 12)).grid(row=0, column=0, padx=10, pady=10, sticky="w")
+com_var = tk.StringVar()
+com_selector = ttk.Combobox(root, textvariable=com_var, values=["Scanning..."], state="readonly", width=20)
+com_selector.grid(row=0, column=1, padx=10, pady=10)
+start_button = tk.Button(root, text="Start", font=("Arial", 12, "bold"))
+start_button.grid(row=0, column=2, padx=10, pady=10)
+
+def refresh_ports():
+    ports = [p.device for p in serial.tools.list_ports.comports()]
+    if not ports:
+        ports = ["No Ports Found"]
+    com_selector["values"] = ports
+    if com_var.get() not in ports:
+        com_var.set(ports[0])
+    root.after(2000, refresh_ports)
+refresh_ports()
+
+# --- Console Box ---
+console_frame = tk.Frame(root)
+console_frame.grid(row=12, column=0, columnspan=5, padx=10, pady=10, sticky="nsew")
+console_text = tk.Text(console_frame, height=10, bg="black", fg="white", font=("Consolas", 10))
+console_scroll = tk.Scrollbar(console_frame, command=console_text.yview)
+console_text.configure(yscrollcommand=console_scroll.set)
+console_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+console_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+# --- Telemetry Labels ---
+for i, field in enumerate(fields, start=1):
+    tk.Label(root, text=field + ":", font=("Arial", 12)).grid(row=i, column=0, sticky="w", padx=10, pady=4)
+    labels[field] = tk.Label(root, text="---", font=("Arial", 12, "bold"), relief="solid", bd=2, width=13, anchor="center", bg="white")
+    labels[field].grid(row=i, column=1, padx=10, pady=4)
+
+# --- 2D Graphs ---
+fig2d, axs = plt.subplots(3, 2, figsize=(6,6))
+fig2d.tight_layout(pad=5.0)
+canvas2d = FigureCanvasTkAgg(fig2d, master=root)
+canvas2d.get_tk_widget().grid(row=1, column=3, rowspan=10, padx=20, pady=10)
+lines = {f: ax.plot([], [])[0] for f, ax in zip(graph_fields, axs.flat)}
+for ax, field in zip(axs.flat, graph_fields):
+    ax.set_title(field)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel(field)
+    ax.grid(True)
+
+# --- 3D Rocket Figure ---
+rocket_fig = plt.figure(figsize=(6,6))
+rocket_ax = rocket_fig.add_subplot(111, projection="3d")
+rocket_ax.set_xlim([-2,2])
+rocket_ax.set_ylim([-2,2])
+rocket_ax.set_zlim([-2,2])
+rocket_ax.set_xlabel("X")
+rocket_ax.set_ylabel("Y")
+rocket_ax.set_zlabel("Z")
+rocket_canvas = FigureCanvasTkAgg(rocket_fig, master=root)
+rocket_canvas.get_tk_widget().grid(row=1, column=4, rowspan=10, padx=20, pady=10)
+
+# --- Rocket Model ---
+def make_rocket(radius=0.3, height=2.0, segments=20):
+    angles = np.linspace(0, 2*np.pi, segments, endpoint=False)
+    circle = np.c_[np.cos(angles) * radius, np.sin(angles) * radius, np.zeros_like(angles)]
+    top = circle + np.array([0,0,height/2])
+    bottom = circle - np.array([0,0,height/2])
+    vertices = np.vstack([top,bottom])
+    faces = []
+    n = len(angles)
+    for i in range(n):
+        j = (i+1)%n
+        faces.append([i,j,n+j,n+i])
+    faces.append(list(range(n)))       # top
+    faces.append(list(range(n,2*n)))  # bottom
+    tip = np.array([[0,0,height/2 + radius*2]])
+    tip_index = len(vertices)
+    vertices = np.vstack([vertices, tip])
+    for i in range(n):
+        j = (i+1)%n
+        faces.append([i,j,tip_index])
+    return vertices, faces
+
+rocket_vertices, rocket_faces = make_rocket()
+
+poly = Poly3DCollection(
+    [[rocket_vertices[idx] for idx in face] for face in rocket_faces],
+    facecolor="grey",   # solid grey
+    edgecolor="black",  # black outlines
+    alpha=1.0           # no transparency
+)
+rocket_ax.add_collection3d(poly)
+
+
+# --- Rocket orientation ---
+angles_data = {"yaw":0.0,"pitch":0.0,"roll":0.0}
+yaw_offset = 0.0
+
+# --- GPS Map ---
+map_file = "gps_map.html"
+gps_points = []
+browser_opened = False
+def update_map(lat, lon):
+    global gps_points, browser_opened
+    gps_points.append((lat, lon))
+    m = folium.Map(location=[lat, lon], zoom_start=17, tiles="CartoDB positron")
+    for p in gps_points:
+        folium.CircleMarker(location=p, radius=4, color="red").add_to(m)
+    folium.PolyLine(gps_points, color="blue", weight=2.5).add_to(m)
+    m.save(map_file)
+    if not browser_opened:
+        webbrowser.open('file://' + os.path.realpath(map_file))
+        browser_opened = True
+
+# --- Serial Handling ---
+ser = None
+running = False
+start_time = time.time()
+latest_data = None
+data_lock = threading.Lock()
+
+def connect_serial(port, baud=115200):
+    global ser
+    while True:
+        try:
+            ser = serial.Serial(port, baud, timeout=0.1)
+            print(f"Connected to {port}")
+            return
+        except Exception as e:
+            print(f"Port busy, retrying... ({e})")
+            time.sleep(2)
+
+def read_serial_thread():
+    global latest_data, angles_data
+    while running:
+        if ser and ser.is_open:
+            line = ser.readline().decode(errors="ignore").strip()
+            if line:
+                console_text.insert(tk.END, line + "\n")
+                console_text.see(tk.END)
+                parts = line.split()
+                if len(parts) >= 10:
+                    with data_lock:
+                        latest_data = parts
+                        try:
+                            yaw, pitch, roll = map(float, parts[:3])
+                            angles_data["yaw"] = np.radians(yaw)
+                            angles_data["pitch"] = np.radians(pitch)
+                            angles_data["roll"] = np.radians(roll)
+                        except:
+                            pass
+
+# --- Rotation Matrix ---
+def rotation_matrix(yaw, pitch, roll):
+    Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0],
+                   [np.sin(yaw), np.cos(yaw), 0],
+                   [0,0,1]])
+    Ry = np.array([[np.cos(pitch),0,np.sin(pitch)],
+                   [0,1,0],
+                   [-np.sin(pitch),0,np.cos(pitch)]])
+    Rx = np.array([[1,0,0],
+                   [0,np.cos(roll),-np.sin(roll)],
+                   [0,np.sin(roll),np.cos(roll)]])
+    return Rz @ Ry @ Rx
+
+# --- GUI Update ---
+def update_gui():
+    global latest_data, start_time
+    with data_lock:
+        parts = latest_data
+
+    if parts:
+        # Update labels
+        for i, f in enumerate(fields):
+            labels[f].config(text=parts[i])
+
+        # Update plots
+        time_data.append(time.time() - start_time)
+        for f in graph_fields:
+            try:
+                idx = fields.index(f)
+                plot_data[f].append(float(parts[idx]))
+            except:
+                plot_data[f].append(0.0)
+
+        # Keep arrays bounded
+        if len(time_data) > 200:
+            time_data.pop(0)
+            for f in graph_fields:
+                plot_data[f].pop(0)
+
+        TIME_WINDOW = 5
+        for f, line_plot in lines.items():
+            line_plot.set_data(time_data, plot_data[f])
+            ax = line_plot.axes
+            ax.relim()
+            ax.autoscale_view()
+            if time_data:
+                ax.set_xlim(max(0,time_data[-1]-TIME_WINDOW), time_data[-1])
+        canvas2d.draw_idle()
+
+        # Update GPS map
+        try:
+            lat = float(parts[fields.index("Latitude")])
+            lon = float(parts[fields.index("Longitude")])
+            update_map(lat, lon)
+        except:
+            pass
+
+    root.after(200, update_gui)
+
+# --- 3D Rocket Update ---
+def update_rocket():
+    global rocket_vertices, rocket_faces
+    while running:
+        yaw, pitch, roll = angles_data["yaw"], angles_data["pitch"], angles_data["roll"]
+        yaw_adj = yaw - yaw_offset
+        R = rotation_matrix(yaw_adj, pitch, roll - np.pi/2)
+        rotated = rocket_vertices @ R.T
+        poly.set_verts([[rotated[idx] for idx in face] for face in rocket_faces])
+        rocket_canvas.draw_idle()
+        time.sleep(0.05)
+
+# --- Reset Yaw Button ---
+def reset_yaw(event=None):
+    global yaw_offset
+    yaw_offset = angles_data["yaw"]
+    print("Yaw reset!")
+
+button_ax = rocket_fig.add_axes([0.8,0.02,0.15,0.05])
+button = Button(button_ax, "Reset Yaw")
+button.on_clicked(reset_yaw)
+
+# --- Start Reading ---
+def start_reading():
+    global running
+    port = com_var.get()
+    if "No Ports" in port or port=="":
+        messagebox.showerror("Error","No valid COM port selected.")
+        return
+    connect_serial(port)
+    running = True
+    threading.Thread(target=read_serial_thread, daemon=True).start()
+    threading.Thread(target=update_rocket, daemon=True).start()
+    update_gui()
+
+start_button.config(command=start_reading)
+
+# --- Graceful Exit ---
+def on_close():
+    global running
+    running = False
+    if ser:
+        try: ser.close()
+        except: pass
+    root.destroy()
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+root.mainloop()
+ 
