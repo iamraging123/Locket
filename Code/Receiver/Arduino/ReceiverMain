@@ -1,0 +1,137 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include "Adafruit_NeoPixel.h"
+
+// Global LoRa SPI object
+SPIClass *loraSPI;
+
+// Led define -----------------------------
+#define LedCount 2
+#define Brightness 50
+#define LedPin 9
+Adafruit_NeoPixel strip(LedCount, LedPin, NEO_GRB + NEO_KHZ800);
+
+// Custom setup function
+bool setupLoRa(int sck, int miso, int mosi, int cs, int rst, int irq, long frequency = 434E6) {
+  loraSPI = new SPIClass(SPI);
+  loraSPI->begin(sck, miso, mosi, cs);
+
+  LoRa.setSPI(*loraSPI);
+  LoRa.setPins(cs, rst, irq);
+
+  if (!LoRa.begin(frequency)) {
+    Serial.println("LoRa init failed!");
+    return false;
+  }
+
+  Serial.println("LoRa init succeeded.");
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  // Same pins as your transmitter
+  int mySCK  = 7;
+  int myMISO = 6;
+  int myMOSI = 5;
+  int myCS   = 0;
+  int myRST  = 4;
+  int myIRQ  = 1;
+
+  if (!setupLoRa(mySCK, myMISO, myMOSI, myCS, myRST, myIRQ)) {
+    while (true); // Stop if LoRa fails
+  }
+
+  Serial.println("LoRa Receiver Ready");
+  SetLedColor("red");
+}
+
+void loop() {
+  int loop = 0;
+
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+
+    if (command.equalsIgnoreCase("RECORD")) {
+      LoRa.beginPacket();
+      LoRa.print("RECORD");
+      LoRa.endPacket();
+      Serial.println("Sent over LoRa: RECORD");
+      SetLedColor("green");
+    }
+    else if (command.equalsIgnoreCase("STOP RECORD")) {
+      LoRa.beginPacket();
+      LoRa.print("STOP RECORD");
+      LoRa.endPacket();
+      Serial.println("Sent over LoRa: STOP RECORD");
+      SetLedColor("red");
+    }
+  }
+
+  // --- 2) Handle incoming LoRa packets ---
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    while (LoRa.available()) {
+      Serial.print((char)LoRa.read());
+    }
+    Serial.print(" ");
+    Serial.println(LoRa.packetRssi()); // <-- your original RSSI style
+  }
+}
+
+
+void SetLedColor(String colorName) {
+  if (colorName == "red") {
+    for (int i = 0; i < LedCount; i++) {
+      strip.setPixelColor(i, strip.Color(255, 0, 0));
+    }
+    strip.show();
+  } else if (colorName == "green") {
+    for (int i = 0; i < LedCount; i++) {
+      strip.setPixelColor(i, strip.Color(0, 255, 0));
+    }
+    strip.show();
+  } else if (colorName == "yellow") {
+    for (int i = 0; i < LedCount; i++) {
+      strip.setPixelColor(i, strip.Color(255, 255, 0));
+    }
+    strip.show();
+  } else if (colorName == "rainbow") {
+    for (int j = 0; j < 256; j++) {
+      byte r, g, b;
+      byte wheelPos = 255 - j;
+
+      if (wheelPos < 85) {
+        r = 255 - wheelPos * 3;
+        g = 0;
+        b = wheelPos * 3;
+      } else if (wheelPos < 170) {
+        wheelPos -= 85;
+        r = 0;
+        g = wheelPos * 3;
+        b = 255 - wheelPos * 3;
+      } else {
+        wheelPos -= 170;
+        r = wheelPos * 3;
+        g = 255 - wheelPos * 3;
+        b = 0;
+      }
+
+      uint32_t color = strip.Color(r, g, b);
+      for (int i = 0; i < LedCount; i++) {
+        strip.setPixelColor(i, color);
+      }
+
+      strip.show();
+      delay(10);
+    }
+  } else if (colorName == "off") {
+    for (int i = 0; i < LedCount; i++) {
+      strip.setPixelColor(i, strip.Color(0, 0, 0));
+    }
+    strip.show();
+  }
+}
