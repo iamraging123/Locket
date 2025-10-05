@@ -1,0 +1,444 @@
+// Libraries ------------------------------
+#include "SPI.h"
+#include "LoRa.h"
+#include "ICM42670P.h"
+#include "Adafruit_NeoPixel.h"
+#include "Melopero_SAM_M8Q.h"
+#include "Wire.h"
+#include "BME280I2C.h"
+#include "EnvironmentCalculations.h"
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
+
+// Testing -------------------------------
+bool useLoRa  = true;
+bool isRecording = true;
+
+// Pin defines ----------------------------
+#define Buzzer_Pin 8
+#define LedPin 9
+
+// Led define -----------------------------
+#define LedCount 2
+#define Brightness 50
+Adafruit_NeoPixel strip(LedCount, LedPin, NEO_GRB + NEO_KHZ800);
+
+// Global LoRa SPI object
+SPIClass *loraSPI;
+
+// IMU  ----------------------------------
+ICM42670 IMU(Wire, 0);
+
+float RateRoll, RatePitch, RateYaw;
+float RateCalibrationRoll = -5.61, RateCalibrationPitch = 0.75, RateCalibrationYaw = -4.42;
+int RateCalibrationNumber;
+float AccX, AccY, AccZ;
+float AngleRoll, AnglePitch, AngleYaw;
+float KalmanAngleRoll = 0, KalmanUncertaintyAngleRoll = 4;
+float KalmanAnglePitch = 0, KalmanUncertaintyAnglePitch = 4;
+float KalmanAngleYaw = 0, KalmanUncertaintyAngleYaw = 4;
+float Kalman1DOutput[] = {0, 0};
+float yaw = 0;
+uint32_t LoopTimer;
+float dt;
+
+// GPS define -----------------------------
+Melopero_SAM_M8Q gps;
+int loopCounter = 0;  
+float latitude = 0;   // keep last known latitude
+float longitude = 0;  // keep last known longitude
+
+// Buzzer define --------------------------
+unsigned int delays[] = { 125, 0 };
+const int numDelays = sizeof(delays) / sizeof(delays[0]);
+
+// Barometer Settings ---------------------
+float referencePressure = 1016;  // hPa local QFF (official meteor-station reading)
+float outdoorTemp = 25;           // °C  measured local outdoor temp.
+float barometerAltitude = 1650.3;  // meters ... map readings + barometer position
+
+BME280I2C::Settings settings(
+   BME280::OSR_X1,
+   BME280::OSR_X1,
+   BME280::OSR_X1,
+   BME280::Mode_Forced,
+   BME280::StandbyTime_1000ms,
+   BME280::Filter_16,
+   BME280::SpiEnable_False,
+   BME280I2C::I2CAddr_0x76
+);
+
+BME280I2C bme(settings);
+
+// LoRa
+
+  // LORA settings 
+  int mySCK  = 7;   // Clock
+  int myMISO = 6;  // MISO
+  int myMOSI = 5;  // MOSI
+  int myCS   = 0;  // NSS
+  int myRST  = 4;  // Reset
+  int myIRQ  = 1;  // DIO0
+  int sf    = 10;          // Spreading Factor (10 = good balance of range & speed)
+  long sbw  = 125E3;       // Bandwidth (125 kHz = standard, long range, decent speed)
+  int CRC   = 5;           // Coding Rate denominator (4/5 = fast but reliable enough)
+  int level = 20;          // Tx Power in dBm (max for SX127x, check legal limit in your region!)
+  int pal   = 12;          // Preamble Length (longer = better sync at distance)
+
+
+
+bool setupLoRa(int sck, int miso, int mosi, int cs, int rst, int irq, long frequency = 434E6) {
+  // Create SPI object with custom pins
+  loraSPI = new SPIClass(SPI);  // or HSPI depending on your ESP32 wiring
+  loraSPI->begin(sck, miso, mosi, cs);
+
+  LoRa.setSpreadingFactor(sf);
+  LoRa.setSignalBandwidth(sbw);
+  LoRa.setCodingRate4(CRC);
+  LoRa.setTxPower(level);
+  LoRa.setPreambleLength(pal);
+
+  // Tell LoRa to use this SPI and our pins
+  LoRa.setSPI(*loraSPI);
+  LoRa.setPins(cs, rst, irq);
+
+  if (!LoRa.begin(frequency)) {
+    Serial.println("LoRa init failed!");
+    return false;
+  }
+
+  Serial.println("LoRa init succeeded.");
+  return true;
+}
+
+void setup() {
+  // Pin setups ---------------------------
+  pinMode(Buzzer_Pin, OUTPUT);
+
+  // Start serial and I2C -----------------
+  Serial.begin(115200);
+  Wire.begin(10, 3, 100000);
+
+  // Wait for serial ----------------------
+  while (!Serial) {}
+
+  // Setup the IMU ------------------------
+  IMUsettings();
+
+  // Setup the GPS ------------------------
+  gps.initI2C();
+  Serial.print("Setting comunication to ubx only: ");
+  Status stat = gps.setCommunicationToUbxOnly();
+  Serial.print(gps.getStatusDescription(stat));
+  //Check if there was an error
+  if (stat != Status::NoError){
+    Serial.println(" Something went wrong... (check connections and restart script)");
+    while (true);
+  }
+
+  bool ack = gps.waitForAcknowledge(CFG_CLASS, CFG_PRT);
+  Serial.print(" acknowledged : ");
+  Serial.println(ack);
+
+  stat = gps.setMeasurementFrequency(2000, 2);
+  Serial.print("Set measurement and navigation solution frequency: ");
+  Serial.print(gps.getStatusDescription(stat));
+  ack = gps.waitForAcknowledge(CFG_CLASS, CFG_RATE);
+  Serial.print(" Acknowledged: ");
+  Serial.println(ack);
+
+  stat = gps.setMessageSendRate(NAV_CLASS, NAV_PVT, 1);
+  Serial.print("Set message send rate: ");
+  Serial.print(gps.getStatusDescription(stat));
+  ack = gps.waitForAcknowledge(CFG_CLASS, CFG_MSG);
+  Serial.print(" Acknowledged: ");
+  Serial.println(ack);
+
+  // Barometer settings -------------------
+  BarometerSettings();
+
+  if (!setupLoRa(mySCK, myMISO, myMOSI, myCS, myRST, myIRQ)) {
+    Serial.println("LORA FAIL");
+  }
+
+  // Start the LEDs -----------------------
+  strip.begin();
+  strip.show();
+  strip.setBrightness(Brightness);
+  SetLedColor("red");
+
+  delay(500);
+}
+
+void loop() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String incoming = "";
+    while (LoRa.available()) {
+      incoming += (char)LoRa.read();
+    }
+
+    Serial.print("Got command: ");
+    Serial.println(incoming);
+
+    if (incoming == "RECORD") {
+      isRecording = true;
+      Serial.println("Recording STARTED");
+    } else if (incoming == "STOP") {
+      isRecording = false;
+      Serial.println("Recording STOPPED");
+    }
+  }
+
+  IMURotation();
+
+  // Ensure these are declared in the function scope before use
+  float temp = NAN;
+  float hum  = NAN;
+  float pres = NAN;
+  float altitude = NAN;    // <- make sure altitude is declared here
+
+  BME280::TempUnit tempUnit(BME280::TempUnit_Celsius);
+  BME280::PresUnit presUnit(BME280::PresUnit_hPa);
+
+  // Only update GPS every _ loops
+  if (loopCounter % 100 == 0) {
+    Status stat = gps.updatePVT(true, 100000);
+    if (stat == Status::NoError) {
+        latitude  = gps.pvtData.latitude / 10000000.0;
+        longitude = gps.pvtData.longitude / 10000000.0;
+    } else {
+        Serial.println("GPS read failed, skipping this loop");
+    }
+  }
+
+  // Read barometer
+  if (bme.chipModel() != BME280::ChipModel_UNKNOWN) {
+  bme.read(pres, temp, hum, tempUnit, presUnit);
+  }
+
+
+  // Compute altitude (now we already have 'pres' to use)
+  EnvironmentCalculations::AltitudeUnit envAltUnit  = EnvironmentCalculations::AltitudeUnit_Meters;
+  EnvironmentCalculations::TempUnit     envTempUnit = EnvironmentCalculations::TempUnit_Celsius;
+
+  altitude = EnvironmentCalculations::Altitude(
+    pres, envAltUnit, referencePressure, outdoorTemp, envTempUnit
+  );
+
+  // Build data as a single string (works for both Serial and LoRa)
+  String SensorData = String(KalmanAngleYaw, 2) + " " +
+                      String(KalmanAnglePitch, 2) + " " +
+                      String(KalmanAngleRoll, 2) + " " +
+                      String(temp) + " " +
+                      String(hum) + " " +
+                      String(pres) + " " +
+                      String(altitude) + " " +
+                      String(latitude, 6) + " " +
+                      String(longitude, 6);
+
+
+  // --- 2) Handle incoming LoRa packets ---
+
+  // Example: only log to SD while recording
+  if (isRecording) {
+    LoRa.beginPacket();
+    LoRa.print(SensorData);  // Change message if needed
+    LoRa.endPacket();  
+    SetLedColor("green");
+    Serial.println(SensorData);
+  }
+
+
+  loopCounter++;
+}
+
+void IMURotation() {
+  inv_imu_sensor_event_t imu_event;
+  IMU.getDataFromRegisters(imu_event);
+
+  // Raw readings
+  float gx = imu_event.gyro[0];
+  float gy = imu_event.gyro[1];
+  float gz = imu_event.gyro[2];
+  float ax = imu_event.accel[0];
+  float ay = imu_event.accel[1];
+  float az = imu_event.accel[2];
+
+  // Timing
+  dt = (micros() - LoopTimer) / 1000000.0;
+  LoopTimer = micros();
+
+  // Subtract offset
+  gx -= RateCalibrationRoll;
+  gy -= RateCalibrationPitch;
+  gz -= RateCalibrationYaw;
+
+  // Store current rates
+  RateRoll = gx;
+  RatePitch = gy;
+  RateYaw = gz*3.4;
+
+  // Accelerometer angles
+  AccX = ax/2048;
+  AccY = ay/2048;
+  AccZ = az/2048-0.01;
+
+  AngleRoll = atan2(AccY, AccZ) * 180.0 / PI;
+  AnglePitch = atan2(-AccX, sqrt(AccY * AccY + AccZ * AccZ)) * 180.0 / PI;
+  AngleYaw   = KalmanAngleYaw; // yaw can't be derived from accelerometer alone
+
+  // Apply Kalman filter for Roll
+  kalman_1d(KalmanAngleRoll, KalmanUncertaintyAngleRoll, RateRoll, AngleRoll);
+  KalmanAngleRoll = Kalman1DOutput[0];
+  KalmanUncertaintyAngleRoll = Kalman1DOutput[1];
+
+  // Apply Kalman filter for Pitch
+  kalman_1d(KalmanAnglePitch, KalmanUncertaintyAnglePitch, RatePitch, AnglePitch);
+  KalmanAnglePitch = Kalman1DOutput[0];
+  KalmanUncertaintyAnglePitch = Kalman1DOutput[1];
+
+  // Integrate gyro Z for yaw (drift will occur)
+  kalman_1d(KalmanAngleYaw, KalmanUncertaintyAngleYaw, RateYaw, AngleYaw);
+  KalmanAngleYaw = Kalman1DOutput[0];
+  KalmanUncertaintyAngleYaw = Kalman1DOutput[1];
+}
+
+void IMUsettings() {
+  int ret;
+  ret = IMU.begin();
+
+  // Initializing the ICM42670
+  if (ret != 0) {
+    Serial.print("ICM42670 initialization failed: ");
+    Serial.println(ret);
+    while (1)
+      ;
+  }
+
+  //IMU SETTINGS ---------------------------------------
+  // Accel ODR = 100 Hz and Full Scale Range = 16G
+  IMU.startAccel(100, 16);
+  // Gyro ODR = 100 Hz and Full Scale Range = 2000 dps
+  IMU.startGyro(100, 2000);
+  // Wait IMU to start
+}
+
+void kalman_1d(float KalmanState, float KalmanUncertainty, float KalmanInput, float KalmanMeasurement) { //function that calculates the predicted angle and uncertanty using Kalman equations
+  KalmanState=KalmanState+0.004*KalmanInput;
+  KalmanUncertainty=KalmanUncertainty + 0.009 * 0.009 * 4 * 4;
+  float KalmanGain=0.5;
+  KalmanState=KalmanState+KalmanGain * (KalmanMeasurement-KalmanState);
+  KalmanUncertainty=(1-KalmanGain) * KalmanUncertainty;
+
+  Kalman1DOutput[0]=KalmanState; //Kalman filter output
+  Kalman1DOutput[1]=KalmanUncertainty;
+}
+
+void SetLedColor(String colorName) {
+  if (colorName == "red") {
+    for (int i = 0; i < LedCount; i++) {
+      strip.setPixelColor(i, strip.Color(255, 0, 0));
+    }
+    strip.show();
+  } else if (colorName == "green") {
+    for (int i = 0; i < LedCount; i++) {
+      strip.setPixelColor(i, strip.Color(0, 255, 0));
+    }
+    strip.show();
+  } else if (colorName == "yellow") {
+    for (int i = 0; i < LedCount; i++) {
+      strip.setPixelColor(i, strip.Color(255, 255, 0));
+    }
+    strip.show();
+  } else if (colorName == "rainbow") {
+    for (int j = 0; j < 256; j++) {
+      byte r, g, b;
+      byte wheelPos = 255 - j;
+
+      if (wheelPos < 85) {
+        r = 255 - wheelPos * 3;
+        g = 0;
+        b = wheelPos * 3;
+      } else if (wheelPos < 170) {
+        wheelPos -= 85;
+        r = 0;
+        g = wheelPos * 3;
+        b = 255 - wheelPos * 3;
+      } else {
+        wheelPos -= 170;
+        r = wheelPos * 3;
+        g = 255 - wheelPos * 3;
+        b = 0;
+      }
+
+      uint32_t color = strip.Color(r, g, b);
+      for (int i = 0; i < LedCount; i++) {
+        strip.setPixelColor(i, color);
+      }
+
+      strip.show();
+      delay(10);
+    }
+  } else if (colorName == "off") {
+    for (int i = 0; i < LedCount; i++) {
+      strip.setPixelColor(i, strip.Color(0, 0, 0));
+    }
+    strip.show();
+  }
+}
+
+void GPSSettings() {
+  gps.initI2C();
+  Serial.print("Setting comunication to ubx only: ");
+  Status stat = gps.setCommunicationToUbxOnly();
+  Serial.print(gps.getStatusDescription(stat));
+  //Check if there was an error
+  if (stat != Status::NoError){
+    Serial.println(" Something went wrong... (check connections and restart script)");
+    while (true);
+  }
+
+  bool ack = gps.waitForAcknowledge(CFG_CLASS, CFG_PRT);
+  Serial.print(" acknowledged : ");
+  Serial.println(ack);
+
+  stat = gps.setMeasurementFrequency(50, 2);
+  Serial.print("Set measurement and navigation solution frequency: ");
+  Serial.print(gps.getStatusDescription(stat));
+  ack = gps.waitForAcknowledge(CFG_CLASS, CFG_RATE);
+  Serial.print(" Acknowledged: ");
+  Serial.println(ack);
+
+  stat = gps.setMessageSendRate(NAV_CLASS, NAV_PVT, 1);
+  Serial.print("Set message send rate: ");
+  Serial.print(gps.getStatusDescription(stat));
+  ack = gps.waitForAcknowledge(CFG_CLASS, CFG_MSG);
+  Serial.print(" Acknowledged: ");
+  Serial.println(ack);
+}
+
+void BarometerSettings(){
+  while(!bme.begin())
+  {
+    Serial.println("Could not find BME280 sensor!");
+    delay(1000);
+  }
+
+  switch(bme.chipModel())
+  {
+     case BME280::ChipModel_BME280:
+       Serial.println("Found BME280 sensor! Success.");
+       break;
+     case BME280::ChipModel_BMP280:
+       Serial.println("Found BMP280 sensor! No Humidity available.");
+       break;
+     default:
+       Serial.println("Found UNKNOWN sensor! Error!");
+  }
+  Serial.print("Assumed outdoor temperature: "); Serial.print(outdoorTemp);
+  Serial.print("°C\nAssumed reduced sea level Pressure: "); Serial.print(referencePressure);
+  Serial.print("hPa\nAssumed barometer altitude: "); Serial.print(barometerAltitude);
+  Serial.println("m\n***************************************");
+}
