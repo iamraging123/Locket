@@ -1,0 +1,394 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import serial
+import serial.tools.list_ports
+import threading
+import time
+import numpy as np
+from collections import deque
+import queue
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.widgets import Button
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import folium
+import os, webbrowser, csv
+from pathlib import Path
+from datetime import datetime
+from math import radians, sin, cos, sqrt, atan2
+
+# ---------------- CONFIG ----------------
+GUI_UPDATE_MS = 100
+ROCKET_UPDATE_MS = 100
+MAX_POINTS = 200
+MAP_UPDATE_SEC = 5
+SERIAL_TIMEOUT = 0.1
+PLOT_TIME_WINDOW = 5
+
+start_lat = None
+start_lon = None
+distance_moved = 0.0
+
+# ---------------- GUI SETUP ----------------
+root = tk.Tk()
+root.title("LOCKET PANEL")
+root.geometry("1700x1300")
+root.configure(bg="white")
+
+recording = tk.BooleanVar(value=False)
+record_file = None
+record_writer = None
+
+fields = ["Yaw","Pitch","Roll","Temp","Humidity","Pressure","Altitude","Latitude","Longitude","RSSI"]
+graph_fields = ["Yaw","Pitch","Roll","Temp","Altitude","Pressure","RSSI"]
+labels = {}
+plot_data = {f: deque(maxlen=MAX_POINTS) for f in graph_fields}
+time_data = deque(maxlen=MAX_POINTS)
+
+# --- COM Selector ---
+tk.Label(root, text="Select COM Port:", font=("Consolas", 12)).grid(row=0, column=0, padx=10, pady=10, sticky="w")
+com_var = tk.StringVar()
+com_selector = ttk.Combobox(root, textvariable=com_var, values=["Scanning..."], state="readonly", width=20)
+com_selector.grid(row=0, column=1, padx=10, pady=10)
+start_button = tk.Button(root, text="Start", font=("Consolas", 12, "bold"))
+start_button.grid(row=0, column=2, padx=10, pady=10)
+
+# --- Console ---
+console_frame = tk.Frame(root)
+console_frame.grid(row=12, column=0, columnspan=5, padx=10, pady=10, sticky="nsew")
+console_text = tk.Text(console_frame, height=10, bg="black", fg="white", font=("Consolas", 10))
+console_scroll = tk.Scrollbar(console_frame, command=console_text.yview)
+console_text.configure(yscrollcommand=console_scroll.set)
+console_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+console_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+console_queue = queue.Queue()
+
+def console_log(msg):
+    console_queue.put(str(msg))
+
+def flush_console():
+    flushed = False
+    while not console_queue.empty():
+        try:
+            line = console_queue.get_nowait()
+            console_text.insert(tk.END, line + "\n")
+            flushed = True
+        except queue.Empty:
+            break
+    if flushed:
+        console_text.see(tk.END)
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371000
+    phi1, phi2 = radians(lat1), radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlambda = radians(lon2 - lon1)
+    a = sin(dphi/2)**2 + cos(phi1) * cos(phi2) * sin(dlambda/2)**2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+# --- GPS color update ---
+TARGET_LAT, TARGET_LON = 40.0, -88.0
+MAX_DIST_METERS = 500000  # distance to consider "near" (adjust if needed)
+
+def update_gps_colors(lat, lon):
+    try:
+        lat_val = float(lat)
+        lon_val = float(lon)
+
+        # Latitude box
+        if lat_val == 0.0:
+            labels["Latitude"].config(bg="#ff4d4d")  # red
+        elif haversine(lat_val, TARGET_LON, TARGET_LAT, TARGET_LON) <= MAX_DIST_METERS:
+            labels["Latitude"].config(bg="#66ff66")  # green
+        else:
+            labels["Latitude"].config(bg="white")
+
+        # Longitude box
+        if lon_val == 0.0:
+            labels["Longitude"].config(bg="#ff4d4d")  # red
+        elif haversine(TARGET_LAT, lon_val, TARGET_LAT, TARGET_LON) <= MAX_DIST_METERS:
+            labels["Longitude"].config(bg="#66ff66")  # green
+        else:
+            labels["Longitude"].config(bg="white")
+    except:
+        labels["Latitude"].config(bg="white")
+        labels["Longitude"].config(bg="white")
+
+# --- Record Toggle ---
+def toggle_record():
+    global record_file, record_writer, start_lat, start_lon, distance_moved
+    if recording.get():
+        # start
+        try:
+            start_lat = float(labels["Latitude"].cget("text"))
+            start_lon = float(labels["Longitude"].cget("text"))
+            console_log(f"Start GPS: {start_lat:.6f}, {start_lon:.6f}")
+        except:
+            start_lat = start_lon = None
+            console_log("Start GPS unavailable.")
+        folder = Path.home() / "Documents" / "Pythoncode" / "RocketRecordings"
+        folder.mkdir(parents=True, exist_ok=True)
+        filename = folder / f"recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        record_file = open(filename, "w", newline="")
+        record_writer = csv.writer(record_file)
+        record_writer.writerow(fields)
+        console_log(f"Recording started → {filename}")
+        try:
+            if ser and ser.is_open:
+                ser.write(b"RECORD\n")
+        except Exception as e:
+            console_log(f"Send RECORD failed: {e}")
+        record_button.config(text="Stop Recording", bg="gray")
+    else:
+        # stop
+        try:
+            if record_file: record_file.close()
+        except: pass
+        record_file = record_writer = None
+        console_log("Recording stopped.")
+        try:
+            if ser and ser.is_open:
+                ser.write(b"STOP RECORD\n")
+        except Exception as e:
+            console_log(f"Send STOP failed: {e}")
+        record_button.config(text="Record", bg="red")
+
+record_button = tk.Checkbutton(root, text="Record", variable=recording,
+    indicatoron=False, font=("Consolas", 12, "bold"), bg="red", fg="white",
+    selectcolor="darkred", command=toggle_record)
+record_button.grid(row=0, column=3, padx=10, pady=10)
+
+# --- Refresh COMs ---
+def refresh_ports():
+    try:
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+    except:
+        ports = []
+    if not ports:
+        ports = ["No Ports Found"]
+    com_selector["values"] = ports
+    if com_var.get() not in ports:
+        com_var.set(ports[0])
+    root.after(2000, refresh_ports)
+refresh_ports()
+
+# --- Labels ---
+label_font = ("Segoe UI", 12)
+value_font = ("Consolas", 12, "bold")
+for i, field in enumerate(fields, start=1):
+    tk.Label(root, text=field + ":", font=label_font, bg="white").grid(row=i, column=0, sticky="w", padx=10, pady=4)
+    labels[field] = tk.Label(root, text="---", font=value_font, relief="solid", bd=2, width=13,
+                             anchor="center", bg="white", fg="black")
+    labels[field].grid(row=i, column=1, padx=10, pady=4)
+
+# Distance Moved box under RSSI
+tk.Label(root, text="Distance Moved:", font=label_font, bg="white").grid(
+    row=len(fields)+1, column=0, sticky="w", padx=10, pady=4)
+labels["Distance Moved"] = tk.Label(root, text="---", font=value_font, relief="solid", bd=2,
+                                    width=13, anchor="center", bg="white", fg="black")
+labels["Distance Moved"].grid(row=len(fields)+1, column=1, padx=10, pady=4)
+
+def update_rssi_color(value):
+    try:
+        v = float(value)
+        if v < -120: labels["RSSI"].config(bg="#ff4d4d")
+        elif -120 <= v < -60: labels["RSSI"].config(bg="#ffd633")
+        else: labels["RSSI"].config(bg="#66ff66")
+    except:
+        labels["RSSI"].config(bg="white")
+
+def update_distance_color(dist):
+    if dist < 30:
+        labels["Distance Moved"].config(bg="#66ff66")
+    elif dist < 300:
+        labels["Distance Moved"].config(bg="#ffd633")
+    else:
+        labels["Distance Moved"].config(bg="#ff4d4d")
+
+# --- 2D Graphs ---
+fig2d, axs = plt.subplots(3, 2, figsize=(6,6))
+fig2d.tight_layout(pad=3.0)
+canvas2d = FigureCanvasTkAgg(fig2d, master=root)
+canvas2d.get_tk_widget().grid(row=1, column=3, rowspan=10, padx=20, pady=10)
+lines = {}
+for ax, field in zip(axs.flat, graph_fields):
+    lines[field], = ax.plot([], [])
+    ax.set_title(field); ax.set_xlabel("Time (s)"); ax.set_ylabel(field); ax.grid(True)
+
+# --- 3D Rocket ---
+rocket_fig = plt.figure(figsize=(6,6))
+rocket_ax = rocket_fig.add_subplot(111, projection="3d")
+rocket_ax.set_xlim([-2,2]); rocket_ax.set_ylim([-2,2]); rocket_ax.set_zlim([-2,2])
+rocket_ax.set_xlabel("X"); rocket_ax.set_ylabel("Y"); rocket_ax.set_zlabel("Z")
+rocket_canvas = FigureCanvasTkAgg(rocket_fig, master=root)
+rocket_canvas.get_tk_widget().grid(row=1, column=4, rowspan=10, padx=20, pady=10)
+
+def make_rocket(radius=0.3, height=2.0, segments=20):
+    angles = np.linspace(0, 2*np.pi, segments, endpoint=False)
+    circle = np.c_[np.cos(angles)*radius, np.sin(angles)*radius, np.zeros_like(angles)]
+    top = circle + [0,0,height/2]; bottom = circle - [0,0,height/2]
+    vertices = np.vstack([top,bottom])
+    faces=[]; n=len(angles)
+    for i in range(n): faces.append([i,(i+1)%n,n+(i+1)%n,n+i])
+    faces.append(list(range(n))); faces.append(list(range(n,2*n)))
+    tip = np.array([[0,0,height/2+radius*2]]); tip_i=len(vertices)
+    vertices=np.vstack([vertices,tip])
+    for i in range(n): faces.append([i,(i+1)%n,tip_i])
+    return vertices, faces
+
+rocket_vertices, rocket_faces = make_rocket()
+poly = Poly3DCollection([[rocket_vertices[i] for i in f] for f in rocket_faces],
+                        facecolor="grey", edgecolor="black", alpha=1.0)
+rocket_ax.add_collection3d(poly)
+
+angles_data = {"yaw":0.0,"pitch":0.0,"roll":0.0}
+yaw_offset = 0.0
+def rotation_matrix(yaw,pitch,roll):
+    cy,sy=np.cos(yaw),np.sin(yaw); cp,sp=np.cos(pitch),np.sin(pitch)
+    cr,sr=np.cos(roll),np.sin(roll)
+    Rz=[[cy,-sy,0],[sy,cy,0],[0,0,1]]
+    Ry=[[cp,0,sp],[0,1,0],[-sp,0,cp]]
+    Rx=[[1,0,0],[0,cr,-sr],[0,sr,cr]]
+    return np.dot(np.dot(Rz,Ry),Rx)
+
+# --- GPS MAP ---
+map_file = "gps_map.html"
+gps_points=[]; browser_opened=False; last_map_update=0
+def update_map(lat,lon):
+    global gps_points,browser_opened,last_map_update
+    now=time.time()
+    if now-last_map_update<MAP_UPDATE_SEC: return
+    last_map_update=now; gps_points.append((lat,lon))
+    m=folium.Map(location=[lat,lon],zoom_start=17,tiles="CartoDB positron")
+    for p in gps_points: folium.CircleMarker(location=p,radius=3,color="red").add_to(m)
+    folium.PolyLine(gps_points,color="blue",weight=2.5).add_to(m)
+    m.save(map_file)
+    if not browser_opened:
+        try: webbrowser.open('file://'+os.path.realpath(map_file)); browser_opened=True
+        except Exception as e: console_log(f"Map open fail: {e}")
+
+# --- SERIAL THREAD ---
+ser=None; running=False; start_time=None
+incoming_queue=queue.Queue(maxsize=1000)
+
+def try_open_serial(port,baud=115200):
+    return serial.Serial(port,baud,timeout=SERIAL_TIMEOUT)
+
+def read_serial_thread(port,baud=115200):
+    global ser,running,record_writer
+    try:
+        ser_local=try_open_serial(port,baud)
+        ser=ser_local
+        console_log(f"Connected to {port}")
+    except Exception as e:
+        console_log(f"Failed to open {port}: {e}")
+        return
+    while running:
+        try:
+            raw=ser_local.readline()
+            if not raw: continue
+            line=raw.decode(errors="ignore").strip()
+            if not line: continue
+            console_queue.put(line)
+            if line.lower() in ["record","start"]:
+                root.after(0, lambda: recording.set(True)); root.after(0, toggle_record); continue
+            if line.lower() in ["stop","stop record"]:
+                root.after(0, lambda: recording.set(False)); root.after(0, toggle_record); continue
+            parts=line.split()
+            if len(parts)==len(fields):
+                try: incoming_queue.put_nowait(parts)
+                except queue.Full: pass
+                if record_writer:
+                    try: record_writer.writerow(parts)
+                    except Exception as e: console_log(f"CSV write fail: {e}")
+        except Exception as e:
+            console_log(f"Serial read error: {e}"); time.sleep(0.1)
+
+# --- GUI UPDATE ---
+def update_gui_once():
+    global start_time, start_lat, start_lon, distance_moved
+    flush_console()
+    latest=None
+    while not incoming_queue.empty():
+        try: latest=incoming_queue.get_nowait()
+        except queue.Empty: break
+    if latest:
+        for i,f in enumerate(fields):
+            try:
+                labels[f].config(text=latest[i])
+                if f=="RSSI": update_rssi_color(latest[i])
+            except: pass
+        try:
+            yaw,pitch,roll=map(float,latest[:3])
+            angles_data["yaw"],angles_data["pitch"],angles_data["roll"]=map(np.radians,[yaw,pitch,roll])
+        except: pass
+        now=time.time()
+        if start_time is None: start_time=now
+        rel_t=now-start_time
+        time_data.append(rel_t)
+        for f in graph_fields:
+            try: plot_data[f].append(float(latest[fields.index(f)]))
+            except: plot_data[f].append(0.0)
+
+        try:
+            lat=float(latest[fields.index("Latitude")])
+            lon=float(latest[fields.index("Longitude")])
+            update_map(lat,lon)
+            update_gps_colors(lat, lon)  # <-- add this line
+
+            if recording.get() and start_lat and start_lon:
+                distance_moved=haversine(start_lat,start_lon,lat,lon)
+                labels["Distance Moved"].config(text=f"{distance_moved:.2f} m")
+                update_distance_color(distance_moved)
+        except: pass
+
+
+        if len(time_data)>2:
+            t_latest=time_data[-1]; xmin=max(0,t_latest-PLOT_TIME_WINDOW)
+            for f,l in lines.items():
+                l.set_data(time_data,plot_data[f])
+                ax=l.axes; ax.relim(); ax.autoscale_view(); ax.set_xlim(xmin,t_latest)
+            canvas2d.draw_idle()
+    root.after(GUI_UPDATE_MS,update_gui_once)
+
+def update_rocket_once():
+    yaw,pitch,roll=angles_data["yaw"],angles_data["pitch"],angles_data["roll"]
+    R=rotation_matrix(yaw-yaw_offset,pitch,roll-np.pi/2)
+    rotated=rocket_vertices@R.T
+    try:
+        poly.set_verts([[rotated[i] for i in f] for f in rocket_faces])
+        rocket_canvas.draw_idle()
+    except Exception as e: console_log(f"Rocket draw: {e}")
+    root.after(ROCKET_UPDATE_MS,update_rocket_once)
+
+def reset_yaw(event=None):
+    global yaw_offset; yaw_offset=angles_data["yaw"]; console_log("Yaw reset!")
+
+button_ax=rocket_fig.add_axes([0.8,0.02,0.15,0.05])
+Button(button_ax,"Reset Yaw").on_clicked(reset_yaw)
+
+def start_reading():
+    global running,start_time
+    port=com_var.get()
+    if not port or "No Ports" in port:
+        console_log("⚠ No valid COM port selected."); return
+    if running: console_log("Already running."); return
+    running=True; start_time=None
+    threading.Thread(target=read_serial_thread,args=(port,),daemon=True).start()
+    root.after(GUI_UPDATE_MS,update_gui_once)
+    root.after(ROCKET_UPDATE_MS,update_rocket_once)
+    console_log("Started reading thread.")
+
+def on_close():
+    global running,record_file,ser
+    running=False; time.sleep(0.05)
+    try: record_file.close()
+    except: pass
+    try: ser.close()
+    except: pass
+    root.destroy()
+
+start_button.config(command=start_reading)
+root.protocol("WM_DELETE_WINDOW",on_close)
+root.after(250,flush_console)
+root.mainloop()
