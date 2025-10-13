@@ -1,3 +1,25 @@
+"""
+╔════════════════════════════════════════════════════════════════════════════╗
+║   Python Rocket Telemetry & Visualization for LOCKET                       ║
+║   https://github.com/iamraging123/Locket                                   ║
+║────────────────────────────────────────────────────────────────────────────║
+║   Real-time rocket sensor data display, 3D visualization, and GPS mapping. ║
+║   Yaw, pitch, roll, altitude, and more—live, recordable, and mapped.       ║
+║                                                                            ║
+║   Built with Tkinter + Matplotlib.                                         ║
+║   Optimized for clarity, speed, and fun.                                   ║
+║                                                                            ║
+║   Author: NoKityHere (2025)                                                ║
+║   Version: 1.3.0                                                           ║
+║   Tested: 10/12/2025                                                       ║
+║────────────────────────────────────────────────────────────────────────────║
+║   LICENSE:                                                                 ║
+║   Attribution required. Free to use, share, and modify.                    ║
+║   Please credit the author if you build on this work.                      ║
+╚════════════════════════════════════════════════════════════════════════════╝
+"""
+
+# ---------------- Imports ----------------
 import tkinter as tk
 from tkinter import ttk, messagebox
 import serial
@@ -16,56 +38,280 @@ import os, webbrowser, csv
 from pathlib import Path
 from datetime import datetime
 from math import radians, sin, cos, sqrt, atan2
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.colors import LightSource
+from mpl_toolkits.mplot3d import Axes3D, art3d
+import tkinter.font as tkfont 
 
 # ---------------- CONFIG ----------------
-GUI_UPDATE_MS = 100
-ROCKET_UPDATE_MS = 100
-MAX_POINTS = 200
-MAP_UPDATE_SEC = 5
-SERIAL_TIMEOUT = 0.1
-PLOT_TIME_WINDOW = 5
+GUI_UPDATE_MS = 100 # GUI update interval
+ROCKET_UPDATE_MS = 100 # rocket 3D update interval
+MAX_POINTS = 200 # max points in graphs
+MAP_UPDATE_SEC = 5 # update map every N seconds
+SERIAL_TIMEOUT = 0.1 # seconds
+PLOT_TIME_WINDOW = 5 # seconds of data to show in plots
+window_active = True #  is window stable for updates
+last_window_move = 0 # timestamp of last window move/resize
+arrow_quiver = None # for 3D direction arrow
+last_altitude = None # for altitude-based arrow scaling
+arrow_update_counter = 0 # counter for arrow update throttling
+ARROW_UPDATE_INTERVAL = 10  # update arrow every N rocket updates
+start_lat = None # starting GPS lat
+start_lon = None # starting GPS lon
+distance_moved = 0.0 # distance moved from start in meters
 
-start_lat = None
-start_lon = None
-distance_moved = 0.0
+# ---------------- Theme ----------------
+BG_MAIN = "#1c1c1c"       # very dark gray (not pure black)
+BG_PANEL = "#242424"      # panel/darker card
+LABEL_BG = "#2b2b2b"      # label box bg
+TEXT_COLOR = "#e0e0e0"    # light gray text
+ACCENT_RED = "#cc0000"    # primary red
+HOVER_RED = "#ff3333"     # hover red
+ACCENT_BORDER = "#cc0000" # thin border color
+CONSOLE_BG = "#000000" # pure black
+CONSOLE_TEXT = "#e0e0e0" # light gray
+GRID_COLOR = "#444444" #  grid lines
+PLOT_BG = "#1a1a1a" # plot background
+
+# ---------------- Fonts ----------------
+FONT_LABEL = ("Consolas", 12, "bold")     # All labels
+FONT_VALUE = ("Consolas", 12, "bold")    # Value boxes
+FONT_BUTTON = ("Consolas", 12, "bold")   # Buttons
+FONT_BUTTON_BIG = ("Consolas", 13, "bold")   # Buttons
+FONT_CONSOLE = ("Consolas", 12, "bold")  # Console text
+
 
 # ---------------- GUI SETUP ----------------
 root = tk.Tk()
-root.title("LOCKET PANEL")
+root.title("LOCKET Control Panel")
 root.geometry("1700x1300")
-root.configure(bg="white")
+root.configure(bg=BG_MAIN)
 
-recording = tk.BooleanVar(value=False)
-record_file = None
+
+style = ttk.Style()
+try:
+    style.theme_use("clam")
+except:
+    pass
+style.configure("TCombobox",
+                fieldbackground=LABEL_BG,
+                background=LABEL_BG,
+                foreground=TEXT_COLOR)
+style.map("TCombobox",
+          fieldbackground=[('readonly', LABEL_BG)],
+          selectbackground=[('readonly', LABEL_BG)])
+style.configure("TLabel", background=BG_MAIN, foreground=TEXT_COLOR)
+
+class FilletedLabel(tk.Canvas): # custom label with rounded corners
+    def __init__(self, master, text="---", width=13, height=28, corner_radius=8,
+                 bg_fill="#2b2b2b", fg="#e0e0e0", font=FONT_VALUE, anchor="center", padding=6, **kwargs):
+        # compute pixel width from char count using font metrics
+        tkf = tkfont.Font(font=font)
+        char_w = tkf.measure("0")  # width of a single char '0' in pixels
+        px_width = max(80, int(char_w * width + padding*2))
+        px_height = max(20, int(height))  # allow passing height in px; ensure minimal height
+
+        super().__init__(master, width=px_width, height=px_height, bg=master.cget("bg"),
+                         highlightthickness=0, **kwargs)
+
+        self._fill = bg_fill
+        self._fg = fg
+        self._font = font
+        self._anchor = anchor
+        self._corner = corner_radius
+        self._padding = padding
+
+        # clamp corner radius so it doesn't exceed half the height
+        self._corner = min(self._corner, px_height // 2 - 1)
+
+        # draw the rounded background once and keep its items grouped by tag 'bg'
+        self._draw_rounded_bg(px_width, px_height, self._corner, self._fill)
+
+        # create real label window on top so text handling, alignment, fonts are native
+        self._label = tk.Label(self, text=text, bg=self._fill, fg=self._fg, font=self._font,
+                               bd=0, relief="flat", anchor=self._anchor)
+        # center the label inside canvas
+        self.create_window(px_width//2, px_height//2, window=self._label)
+
+    def _draw_rounded_bg(self, w, h, r, fill):
+        # Clear previous bg items
+        self.delete("bg")
+        # center rect area
+        # middle rectangle to fill central area
+        self.create_rectangle(r, 0, w - r, h, outline="", fill=fill, tags=("bg",))
+        # vertical middle fill to ensure full coverage between arcs
+        self.create_rectangle(0, r, w, h - r, outline="", fill=fill, tags=("bg",))
+        # four corner ovals
+        self.create_oval(0, 0, 2*r, 2*r, outline="", fill=fill, tags=("bg",))
+        self.create_oval(w - 2*r, 0, w, 2*r, outline="", fill=fill, tags=("bg",))
+        self.create_oval(0, h - 2*r, 2*r, h, outline="", fill=fill, tags=("bg",))
+        self.create_oval(w - 2*r, h - 2*r, w, h, outline="", fill=fill, tags=("bg",))
+
+    # Proxy config to inner label and update bg when needed
+    def config(self, **kwargs):
+        # handle background first
+        if "bg" in kwargs or "background" in kwargs:
+            bg = kwargs.get("bg", kwargs.get("background"))
+            if bg is not None:
+                self._fill = bg
+                # update canvas bg shapes
+                self.itemconfig("bg", fill=self._fill)
+                # update label bg so it visually blends
+                self._label.config(bg=self._fill)
+
+        # other forwarded options for the inner label
+        label_opts = {}
+        for key in ("text", "fg", "font", "anchor", "width"):
+            if key in kwargs:
+                label_opts[key] = kwargs[key]
+        if label_opts:
+            self._label.config(**label_opts)
+
+    def cget(self, key):
+        if key in ("text", "fg", "font", "anchor", "width"):
+            return self._label.cget(key)
+        if key in ("bg", "background"):
+            return self._fill
+        return super().cget(key)
+
+    # convenience accessors
+    def set_text(self, txt):
+        self._label.config(text=txt)
+    def get_text(self):
+        return self._label.cget("text")
+
+recording = tk.BooleanVar(value=False) # recording state
+record_file = None # file handle
 record_writer = None
 
-fields = ["Yaw","Pitch","Roll","Temp","Humidity","Pressure","Altitude","Latitude","Longitude","RSSI"]
-graph_fields = ["Yaw","Pitch","Roll","Temp","Altitude","Pressure","RSSI"]
+fields = ["Yaw","Pitch","Roll","Temp","Humidity","Pressure","Altitude","Latitude","Longitude","RSSI"] # expected fields
+graph_fields = ["Yaw","Pitch","Roll","Temp","Altitude","Pressure","RSSI"] # fields to graph
 labels = {}
-plot_data = {f: deque(maxlen=MAX_POINTS) for f in graph_fields}
+plot_data = {f: deque(maxlen=MAX_POINTS) for f in graph_fields} # data for plots
 time_data = deque(maxlen=MAX_POINTS)
 
-# --- COM Selector ---
-tk.Label(root, text="Select COM Port:", font=("Consolas", 12)).grid(row=0, column=0, padx=10, pady=10, sticky="w")
+def on_window_config(event): # track window moves/resizes to pause updates
+    global window_active, last_window_move
+    window_active = False
+    last_window_move = time.time()
+    root.after(100, check_window_stable)
+
+def check_window_stable(): # check if window has been stable for 0.5s
+    global window_active, last_window_move
+    # If 0.5s has passed since the last move/resize, resume updates
+    if time.time() - last_window_move >= 0.5:
+        window_active = True
+    else:
+        root.after(100, check_window_stable)
+
+root.bind("<Configure>", on_window_config)
+
+# --- COM Selector (Red Themed) ---
+style = ttk.Style()
+style.theme_use('default')
+
+# Create a custom red style for the Combobox
+style.configure(
+    "Red.TCombobox",
+    fieldbackground=BG_MAIN,   # Background inside box
+    background=ACCENT_RED,        # Dropdown background
+    foreground=BG_MAIN,        # Text color
+    arrowcolor=BG_MAIN,        # Arrow color
+    bordercolor=BG_MAIN,    # Optional border color
+    lightcolor=BG_MAIN,
+    darkcolor=BG_MAIN
+)
+
+# Create label + styled COM selector
+tk.Label(root, text="Select COM Port:", font=FONT_LABEL,
+         fg=ACCENT_RED, bg=BG_MAIN).grid(row=0, column=0, padx=10, pady=10, sticky="w")
+
+# Create the Combobox with the custom style
 com_var = tk.StringVar()
-com_selector = ttk.Combobox(root, textvariable=com_var, values=["Scanning..."], state="readonly", width=20)
+com_selector = ttk.Combobox(root, textvariable=com_var, values=["Scanning..."],
+                            state="readonly", width=20, style="Red.TCombobox")
 com_selector.grid(row=0, column=1, padx=10, pady=10)
-start_button = tk.Button(root, text="Start", font=("Consolas", 12, "bold"))
-start_button.grid(row=0, column=2, padx=10, pady=10)
+
+# --- Button Frame (Start + Record + Blinking Dot) ---
+button_frame = tk.Frame(root, bg=BG_MAIN)
+button_frame.grid(row=0, column=2, columnspan=2, padx=10, pady=10, sticky="w")
+
+def start_reading():
+    global running,start_time
+    port=com_var.get()
+    if not port or "No Ports" in port:
+        console_log("⚠ No valid COM port selected."); return
+    if running: console_log("Already running."); return
+    running=True; start_time=None
+    threading.Thread(target=read_serial_thread,args=(port,),daemon=True).start()
+    root.after(GUI_UPDATE_MS,update_gui_once)
+    root.after(ROCKET_UPDATE_MS,update_rocket_once)
+    console_log("Started reading thread.")
+
+# --- Start Button ---
+start_button = tk.Button(button_frame, text="Start", font=FONT_BUTTON,
+                         bg=ACCENT_RED, fg=TEXT_COLOR, activebackground=HOVER_RED,
+                         relief="flat", bd=0, padx=10, pady=0, command=start_reading)
+start_button.pack(side=tk.LEFT)
+
+# Hover effects
+def _on_enter_start(e):
+    start_button.config(bg=HOVER_RED)
+def _on_leave_start(e):
+    start_button.config(bg=ACCENT_RED)
+start_button.bind("<Enter>", _on_enter_start)
+start_button.bind("<Leave>", _on_leave_start)
+
+# --- Record Button ---
+record_button = tk.Checkbutton(button_frame, text="Record", variable=recording,
+    indicatoron=False, font=FONT_BUTTON_BIG, bg=ACCENT_RED, fg=TEXT_COLOR,
+    selectcolor=HOVER_RED, command=lambda:[toggle_record()],
+    relief="flat", bd=0, activebackground=HOVER_RED)
+record_button.pack(side=tk.LEFT, padx=6)
+
+# Hover effects
+def _on_enter_record(e):
+    record_button.config(bg=HOVER_RED)
+def _on_leave_record(e):
+    record_button.config(bg=ACCENT_RED if not recording.get() else BG_PANEL)
+record_button.bind("<Enter>", _on_enter_record)
+record_button.bind("<Leave>", _on_leave_record)
+
+# --- Blinking Red Dot Indicator ---
+record_dot = tk.Label(button_frame, text="●", font=("Consolas", 16, "bold"),
+                      fg=BG_MAIN, bg=BG_MAIN)  # initially invisible
+record_dot.pack(side=tk.LEFT, padx=(6, 0))
+record_dot_visible = False
+
+def blink_record_dot():
+    global record_dot_visible
+    if recording.get():
+        record_dot_visible = not record_dot_visible
+        record_dot.config(fg=ACCENT_RED if record_dot_visible else BG_MAIN)
+    else:
+        record_dot.config(fg=BG_MAIN)
+    root.after(500, blink_record_dot)  # blink every 500ms
+
+# Start blinking loop
+blink_record_dot()
 
 # --- Console ---
-console_frame = tk.Frame(root)
+console_frame = tk.Frame(root, bg=BG_PANEL, highlightbackground=ACCENT_BORDER, highlightthickness=1)
 console_frame.grid(row=12, column=0, columnspan=5, padx=10, pady=10, sticky="nsew")
-console_text = tk.Text(console_frame, height=10, bg="black", fg="white", font=("Consolas", 10))
+console_text = tk.Text(console_frame, height=10, bg=CONSOLE_BG, fg=CONSOLE_TEXT,
+                       insertbackground=CONSOLE_TEXT, font=FONT_CONSOLE, relief="flat")
 console_scroll = tk.Scrollbar(console_frame, command=console_text.yview)
 console_text.configure(yscrollcommand=console_scroll.set)
 console_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 console_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 console_queue = queue.Queue()
 
+# --- Console Logging ---
 def console_log(msg):
     console_queue.put(str(msg))
 
+
+# --- Flush console queue to text widget ---
 def flush_console():
     flushed = False
     while not console_queue.empty():
@@ -78,6 +324,7 @@ def flush_console():
     if flushed:
         console_text.see(tk.END)
 
+# --- Haversine formula for GPS distance ---
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000
     phi1, phi2 = radians(lat1), radians(lat2)
@@ -88,7 +335,7 @@ def haversine(lat1, lon1, lat2, lon2):
 
 # --- GPS color update ---
 TARGET_LAT, TARGET_LON = 40.0, -88.0
-MAX_DIST_METERS = 500000  # distance to consider "near" (adjust if needed)
+MAX_DIST_METERS = 50000  # distance to consider "near" (adjust if needed)
 
 def update_gps_colors(lat, lon):
     try:
@@ -97,22 +344,22 @@ def update_gps_colors(lat, lon):
 
         # Latitude box
         if lat_val == 0.0:
-            labels["Latitude"].config(bg="#ff4d4d")  # red
+            labels["Latitude"].config(bg="#cc0000")  # red
         elif haversine(lat_val, TARGET_LON, TARGET_LAT, TARGET_LON) <= MAX_DIST_METERS:
-            labels["Latitude"].config(bg="#66ff66")  # green
+            labels["Latitude"].config(bg="#339933")  # green
         else:
-            labels["Latitude"].config(bg="white")
+            labels["Latitude"].config(bg=LABEL_BG)
 
         # Longitude box
         if lon_val == 0.0:
-            labels["Longitude"].config(bg="#ff4d4d")  # red
+            labels["Longitude"].config(bg="#cc0000")  # red
         elif haversine(TARGET_LAT, lon_val, TARGET_LAT, TARGET_LON) <= MAX_DIST_METERS:
-            labels["Longitude"].config(bg="#66ff66")  # green
+            labels["Longitude"].config(bg="#339933")  # green
         else:
-            labels["Longitude"].config(bg="white")
+            labels["Longitude"].config(bg=LABEL_BG)
     except:
-        labels["Latitude"].config(bg="white")
-        labels["Longitude"].config(bg="white")
+        labels["Latitude"].config(bg=LABEL_BG)
+        labels["Longitude"].config(bg=LABEL_BG)
 
 # --- Record Toggle ---
 def toggle_record():
@@ -138,7 +385,7 @@ def toggle_record():
                 ser.write(b"RECORD\n")
         except Exception as e:
             console_log(f"Send RECORD failed: {e}")
-        record_button.config(text="Stop Recording", bg="gray")
+        record_button.config(text="Stop Recording", bg=BG_PANEL, fg=TEXT_COLOR)
     else:
         # stop
         try:
@@ -151,12 +398,8 @@ def toggle_record():
                 ser.write(b"STOP RECORD\n")
         except Exception as e:
             console_log(f"Send STOP failed: {e}")
-        record_button.config(text="Record", bg="red")
-
-record_button = tk.Checkbutton(root, text="Record", variable=recording,
-    indicatoron=False, font=("Consolas", 12, "bold"), bg="red", fg="white",
-    selectcolor="darkred", command=toggle_record)
-record_button.grid(row=0, column=3, padx=10, pady=10)
+        record_button.config(text="Record", bg=ACCENT_RED, fg=TEXT_COLOR)
+        record_dot.config(fg=BG_MAIN)  # ensure dot hides when stopped
 
 # --- Refresh COMs ---
 def refresh_ports():
@@ -173,74 +416,243 @@ def refresh_ports():
 refresh_ports()
 
 # --- Labels ---
-label_font = ("Segoe UI", 12)
-value_font = ("Consolas", 12, "bold")
+label_font = FONT_LABEL
+value_font = FONT_LABEL
 for i, field in enumerate(fields, start=1):
-    tk.Label(root, text=field + ":", font=label_font, bg="white").grid(row=i, column=0, sticky="w", padx=10, pady=4)
-    labels[field] = tk.Label(root, text="---", font=value_font, relief="solid", bd=2, width=13,
-                             anchor="center", bg="white", fg="black")
-    labels[field].grid(row=i, column=1, padx=10, pady=4)
+    tk.Label(root, text=field + ":", font=label_font, bg=BG_MAIN, fg=ACCENT_RED).grid(
+        row=i, column=0, sticky="w", padx=10, pady=4)
+
+    # create filleted (rounded) value box
+    fl = FilletedLabel(root, text="---", width=13, height=28, corner_radius=8,
+                       bg_fill=LABEL_BG, fg=TEXT_COLOR, font=FONT_VALUE, anchor="center")
+    fl.grid(row=i, column=1, padx=10, pady=4)
+    labels[field] = fl
+
 
 # Distance Moved box under RSSI
-tk.Label(root, text="Distance Moved:", font=label_font, bg="white").grid(
+tk.Label(root, text="Distance Moved:", font=label_font, bg=BG_MAIN, fg=ACCENT_RED).grid(
     row=len(fields)+1, column=0, sticky="w", padx=10, pady=4)
-labels["Distance Moved"] = tk.Label(root, text="---", font=value_font, relief="solid", bd=2,
-                                    width=13, anchor="center", bg="white", fg="black")
+labels["Distance Moved"] = FilletedLabel(root, text="---", width=13, height=28, corner_radius=8,
+                                         bg_fill=LABEL_BG, fg=TEXT_COLOR, font=value_font, anchor="center")
 labels["Distance Moved"].grid(row=len(fields)+1, column=1, padx=10, pady=4)
 
+# --- Color Update Functions ---
 def update_rssi_color(value):
     try:
         v = float(value)
         if v < -120: labels["RSSI"].config(bg="#ff4d4d")
         elif -120 <= v < -60: labels["RSSI"].config(bg="#ffd633")
-        else: labels["RSSI"].config(bg="#66ff66")
+        else: labels["RSSI"].config(bg="#339933")
     except:
-        labels["RSSI"].config(bg="white")
+        labels["RSSI"].config(bg=LABEL_BG)
 
+# --- Distance Moved Color Update ---
 def update_distance_color(dist):
     if dist < 30:
-        labels["Distance Moved"].config(bg="#66ff66")
+        labels["Distance Moved"].config(bg="#339933")
     elif dist < 300:
         labels["Distance Moved"].config(bg="#ffd633")
     else:
         labels["Distance Moved"].config(bg="#ff4d4d")
 
 # --- 2D Graphs ---
-fig2d, axs = plt.subplots(3, 2, figsize=(6,6))
-fig2d.tight_layout(pad=3.0)
+# Apply matplotlib dark theme for these figures
+plt.rcParams.update({
+    "axes.facecolor": PLOT_BG,
+    "figure.facecolor": BG_MAIN,
+    "savefig.facecolor": BG_MAIN,
+    "axes.edgecolor": ACCENT_BORDER,
+    "xtick.color": TEXT_COLOR,
+    "ytick.color": TEXT_COLOR,
+    "axes.labelcolor": TEXT_COLOR,
+    "axes.titlecolor": ACCENT_RED,
+    "grid.color": GRID_COLOR
+})
+
+# Create 3x2 grid of subplots
+fig2d, axs = plt.subplots(3, 2, figsize=(6.5,6.5))
+fig2d.tight_layout(pad=4)
 canvas2d = FigureCanvasTkAgg(fig2d, master=root)
 canvas2d.get_tk_widget().grid(row=1, column=3, rowspan=10, padx=20, pady=10)
 lines = {}
 for ax, field in zip(axs.flat, graph_fields):
-    lines[field], = ax.plot([], [])
-    ax.set_title(field); ax.set_xlabel("Time (s)"); ax.set_ylabel(field); ax.grid(True)
+    lines[field], = ax.plot([], [], color=ACCENT_RED, linewidth=2)
+    ax.set_title(field, fontdict={'family': 'Consolas', 'size': 12, 'weight':'bold'})  # title color
+    ax.set_xlabel("Time (s)", fontdict={'family': 'Consolas', 'size': 12, 'weight':'bold'})
+    ax.set_ylabel(field, fontdict={'family': 'Consolas', 'size': 12, 'weight':'bold'})
+    ax.grid(True)
+    ax.set_facecolor(PLOT_BG)
+    for spine in ax.spines.values():
+        spine.set_color(ACCENT_BORDER)
 
-# --- 3D Rocket ---
-rocket_fig = plt.figure(figsize=(6,6))
+    # Change tick labels font and size
+    ax.tick_params(axis='x', colors=TEXT_COLOR, labelsize=10)  # x-axis tick labels
+    ax.tick_params(axis='y', colors=TEXT_COLOR, labelsize=10)  # y-axis tick labels
+
+    for label in ax.get_xticklabels() + ax.get_yticklabels():
+        label.set_fontweight('bold')
+
+# --- 3D Rocket (clean, no axes) ---
+rocket_fig = plt.figure(figsize=(6, 6), facecolor=BG_MAIN)
+rocket_fig.patch.set_facecolor(BG_MAIN)
+
+# Axes background (behind the 3D rocket)
 rocket_ax = rocket_fig.add_subplot(111, projection="3d")
-rocket_ax.set_xlim([-2,2]); rocket_ax.set_ylim([-2,2]); rocket_ax.set_zlim([-2,2])
-rocket_ax.set_xlabel("X"); rocket_ax.set_ylabel("Y"); rocket_ax.set_zlabel("Z")
+rocket_ax.set_facecolor(BG_MAIN)  # color behind the rocket itself
+rocket_ax.set_axis_off()  # hide axes, ticks, labels
+
+# Set limits so the rocket is centered
+rocket_ax.set_xlim([-2, 2])
+rocket_ax.set_ylim([-2, 2])
+rocket_ax.set_zlim([-2, 2])
+
+# Add to Tkinter
 rocket_canvas = FigureCanvasTkAgg(rocket_fig, master=root)
 rocket_canvas.get_tk_widget().grid(row=1, column=4, rowspan=10, padx=20, pady=10)
 
-def make_rocket(radius=0.3, height=2.0, segments=20):
+# --- Create Rocket Mesh ---
+def make_rocket(radius=0.2, height=6.0, segments=20, tip_length=1.8, tip_smoothness=12,
+                fin_height=0.33, fin_thickness=0.04, root_chord= 0.8, tip_chord=0.1, sweep=-0.3):
     angles = np.linspace(0, 2*np.pi, segments, endpoint=False)
     circle = np.c_[np.cos(angles)*radius, np.sin(angles)*radius, np.zeros_like(angles)]
-    top = circle + [0,0,height/2]; bottom = circle - [0,0,height/2]
-    vertices = np.vstack([top,bottom])
-    faces=[]; n=len(angles)
-    for i in range(n): faces.append([i,(i+1)%n,n+(i+1)%n,n+i])
-    faces.append(list(range(n))); faces.append(list(range(n,2*n)))
-    tip = np.array([[0,0,height/2+radius*2]]); tip_i=len(vertices)
-    vertices=np.vstack([vertices,tip])
-    for i in range(n): faces.append([i,(i+1)%n,tip_i])
+    top = circle + [0, 0, height/2 - tip_length]
+    bottom = circle - [0, 0, height/2]
+    vertices = np.vstack([top, bottom])
+    faces = []
+    n = len(angles)
+
+    # --- Cylinder sides ---
+    for i in range(n):
+        faces.append([i, (i+1) % n, n + (i+1) % n, n + i])
+
+    # --- Smooth ogive tip ---
+    z_tip = np.linspace(0, tip_length, tip_smoothness)
+    r_tip = radius * (1 - (z_tip / tip_length)**2)
+    tip_vertices = []
+    for zi, ri in zip(z_tip[:-1], r_tip[:-1]):
+        for theta in angles:
+            tip_vertices.append([ri*np.cos(theta), ri*np.sin(theta), height/2 - tip_length + zi])
+    tip_vertices = np.array(tip_vertices)
+    tip_start = len(vertices)
+    vertices = np.vstack([vertices, tip_vertices])
+
+    # Connect top ring to first tip ring
+    for j in range(n):
+        a, b = j, (j + 1) % n
+        c, d = tip_start + (j + 1) % n, tip_start + j
+        faces.append([a, b, c, d])
+
+    tip_rings = tip_smoothness - 1
+    for k in range(tip_rings - 2):
+        ring1 = tip_start + k * n
+        ring2 = tip_start + (k + 1) * n
+        for j in range(n):
+            a = ring1 + j
+            b = ring1 + (j + 1) % n
+            c = ring2 + (j + 1) % n
+            d = ring2 + j
+            faces.append([a, b, c, d])
+
+    tip_point = np.array([[0, 0, height/2]])
+    tip_i = len(vertices)
+    vertices = np.vstack([vertices, tip_point])
+
+    last_ring = tip_start + (tip_rings - 2) * n
+    for j in range(n):
+        a = last_ring + j
+        b = last_ring + (j + 1) % n
+        faces.append([a, b, tip_i])
+
+    # --- Bottom face ---
+    faces.append(list(range(n, 2*n)))
+
+    # --- Add 3 swept-back fins ---
+    fin_angles = np.linspace(0, 2*np.pi, 4)[:-1]
+    fin_vertices = []
+    fin_faces = []
+    base_start = len(vertices)
+
+    for i, angle in enumerate(fin_angles):
+        ca, sa = np.cos(angle), np.sin(angle)
+        def rot(x, y):
+            return np.array([x*ca - y*sa, x*sa + y*ca])
+
+        fin_base_z = -height/2
+        fin_root_front_z = fin_base_z
+        fin_root_back_z = fin_base_z + root_chord
+        fin_tip_front_z = fin_base_z + sweep
+        fin_tip_back_z = fin_base_z + sweep + tip_chord
+
+        # Fin points (2D profile)
+        fin_pts = np.array([
+            [radius, 0, fin_root_front_z],                     # root front
+            [radius, 0, fin_root_back_z],                      # root back
+            [radius + fin_height, 0, fin_tip_back_z],          # tip back (swept)
+            [radius + fin_height, 0, fin_tip_front_z]          # tip front
+        ])
+
+        # Add thickness
+        fin_side1 = np.array([np.r_[rot(x, fin_thickness/2), z] for x, _, z in fin_pts])
+        fin_side2 = np.array([np.r_[rot(x, -fin_thickness/2), z] for x, _, z in fin_pts])
+        fin_vertices.extend(np.vstack([fin_side1, fin_side2]))
+
+        base_i = base_start + i * 8
+        fin_faces += [
+            [base_i, base_i+1, base_i+2, base_i+3],           # outside
+            [base_i+4, base_i+5, base_i+6, base_i+7],         # inside
+            [base_i, base_i+4, base_i+7, base_i+3],           # leading edge
+            [base_i+1, base_i+5, base_i+6, base_i+2],         # trailing edge
+            [base_i+3, base_i+2, base_i+6, base_i+7],         # tip
+            [base_i, base_i+1, base_i+5, base_i+4],           # root
+        ]
+
+    vertices = np.vstack([vertices, fin_vertices])
+    faces.extend(fin_faces)
+
     return vertices, faces
 
+# --- Build rocket with smooth per-vertex shading ---
 rocket_vertices, rocket_faces = make_rocket()
-poly = Poly3DCollection([[rocket_vertices[i] for i in f] for f in rocket_faces],
-                        facecolor="grey", edgecolor="black", alpha=1.0)
+
+# --- Compute per-vertex normals ---
+vertex_normals = np.zeros_like(rocket_vertices)
+for f in rocket_faces:
+    v0, v1, v2 = [rocket_vertices[i] for i in f[:3]]
+    n = np.cross(v1 - v0, v2 - v0)
+    norm = np.linalg.norm(n)
+    if norm > 0:
+        n = n / norm
+    for i in f:
+        vertex_normals[i] += n
+
+# Normalize vertex normals
+vertex_normals = np.array([n/np.linalg.norm(n) if np.linalg.norm(n)>0 else n for n in vertex_normals])
+
+# --- Apply lighting per vertex ---
+light_dir = np.array([1, 1, 2])
+light_dir = light_dir / np.linalg.norm(light_dir)
+
+# Base color
+base_color = np.array([204/255, 0, 0])
+
+# Compute color for each vertex
+vertex_colors = np.clip(np.dot(vertex_normals, light_dir), 0.1, 1.0)[:, np.newaxis] * base_color
+
+# --- Create Poly3DCollection with per-vertex shading ---
+face_colors = []
+for f in rocket_faces:
+    face_colors.append(vertex_colors[f].mean(axis=0))
+
+# Create and add the Poly3DCollection to the axes
+poly = Poly3DCollection(
+    [[rocket_vertices[i] for i in f] for f in rocket_faces],
+    facecolors=face_colors,
+    edgecolor='none',
+    alpha=1.0
+)
 rocket_ax.add_collection3d(poly)
 
+# --- Rotation Matrix ---
 angles_data = {"yaw":0.0,"pitch":0.0,"roll":0.0}
 yaw_offset = 0.0
 def rotation_matrix(yaw,pitch,roll):
@@ -271,9 +683,11 @@ def update_map(lat,lon):
 ser=None; running=False; start_time=None
 incoming_queue=queue.Queue(maxsize=1000)
 
+# Serial port timeout
 def try_open_serial(port,baud=115200):
     return serial.Serial(port,baud,timeout=SERIAL_TIMEOUT)
 
+# --- Serial Reading Thread ---
 def read_serial_thread(port,baud=115200):
     global ser,running,record_writer
     try:
@@ -306,9 +720,17 @@ def read_serial_thread(port,baud=115200):
 
 # --- GUI UPDATE ---
 def update_gui_once():
-    global start_time, start_lat, start_lon, distance_moved
+    
+    global start_time, start_lat, start_lon, distance_moved, LAST_PLOT_UPDATE, window_active
+
+    # Pause updates when window is being moved or resized
+    if not window_active:
+        root.after(GUI_UPDATE_MS, update_gui_once)
+        return
+
     flush_console()
-    latest=None
+    latest = None
+
     while not incoming_queue.empty():
         try: latest=incoming_queue.get_nowait()
         except queue.Empty: break
@@ -351,34 +773,65 @@ def update_gui_once():
             canvas2d.draw_idle()
     root.after(GUI_UPDATE_MS,update_gui_once)
 
+# --- ROCKET UPDATE ---
 def update_rocket_once():
-    yaw,pitch,roll=angles_data["yaw"],angles_data["pitch"],angles_data["roll"]
-    R=rotation_matrix(yaw-yaw_offset,pitch,roll-np.pi/2)
-    rotated=rocket_vertices@R.T
+    global last_altitude, arrow_quiver, arrow_update_counter
+
+    yaw, pitch, roll = angles_data["yaw"], angles_data["pitch"], angles_data["roll"]
+    R = rotation_matrix(yaw - yaw_offset, pitch, roll - np.pi/2)
+    rotated = rocket_vertices @ R.T
+
     try:
+        # Update rocket mesh
         poly.set_verts([[rotated[i] for i in f] for f in rocket_faces])
+
+        # --- Arrow update throttling ---
+        arrow_update_counter += 1
+        if arrow_update_counter >= ARROW_UPDATE_INTERVAL:
+            arrow_update_counter = 0
+
+            try:
+                current_alt = float(labels["Altitude"].cget("text"))
+            except:
+                current_alt = 0.0
+
+            if last_altitude is None:
+                last_altitude = current_alt
+
+            if current_alt < 3.0:
+                # Hide arrow if altitude < 1 ft
+                if arrow_quiver:
+                    arrow_quiver.remove()
+                    arrow_quiver = None
+            else:
+                # Determine trend
+                if current_alt > last_altitude:
+                    arrow_dir = np.array([0, 0, 1])  # Up
+                else:
+                    arrow_dir = np.array([0, 0, -1])  # Down
+
+                last_altitude = current_alt
+
+                # Remove old arrow
+                if arrow_quiver:
+                    arrow_quiver.remove()
+
+                # Draw new arrow slightly above and to the side of rocket
+                rocket_tip = np.array([2, 0, -3])  # X offset + above tip
+                arrow_length = 1.0
+                arrow_quiver = rocket_ax.quiver(
+                    rocket_tip[0], rocket_tip[1], rocket_tip[2],
+                    arrow_dir[0], arrow_dir[1], arrow_dir[2],
+                    length=arrow_length, color='red', linewidth=2, arrow_length_ratio=0.3
+                )
+
         rocket_canvas.draw_idle()
-    except Exception as e: console_log(f"Rocket draw: {e}")
-    root.after(ROCKET_UPDATE_MS,update_rocket_once)
+    except Exception as e:
+        console_log(f"Rocket draw: {e}")
 
-def reset_yaw(event=None):
-    global yaw_offset; yaw_offset=angles_data["yaw"]; console_log("Yaw reset!")
+    root.after(ROCKET_UPDATE_MS, update_rocket_once)
 
-button_ax=rocket_fig.add_axes([0.8,0.02,0.15,0.05])
-Button(button_ax,"Reset Yaw").on_clicked(reset_yaw)
-
-def start_reading():
-    global running,start_time
-    port=com_var.get()
-    if not port or "No Ports" in port:
-        console_log("⚠ No valid COM port selected."); return
-    if running: console_log("Already running."); return
-    running=True; start_time=None
-    threading.Thread(target=read_serial_thread,args=(port,),daemon=True).start()
-    root.after(GUI_UPDATE_MS,update_gui_once)
-    root.after(ROCKET_UPDATE_MS,update_rocket_once)
-    console_log("Started reading thread.")
-
+# --- Clean Exit ---
 def on_close():
     global running,record_file,ser
     running=False; time.sleep(0.05)
@@ -388,7 +841,7 @@ def on_close():
     except: pass
     root.destroy()
 
-start_button.config(command=start_reading)
+# --- Start Main Loop ---
 root.protocol("WM_DELETE_WINDOW",on_close)
 root.after(250,flush_console)
 root.mainloop()
