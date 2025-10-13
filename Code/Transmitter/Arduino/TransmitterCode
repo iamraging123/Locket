@@ -80,37 +80,32 @@ BME280I2C bme(settings);
   int myCS   = 0;  // NSS
   int myRST  = 4;  // Reset
   int myIRQ  = 1;  // DIO0
-  int sf    = 10;          // Spreading Factor (10 = good balance of range & speed)
-  long sbw  = 125E3;       // Bandwidth (125 kHz = standard, long range, decent speed)
-  int CRC   = 5;           // Coding Rate denominator (4/5 = fast but reliable enough)
-  int level = 20;          // Tx Power in dBm (max for SX127x, check legal limit in your region!)
-  int pal   = 12;          // Preamble Length (longer = better sync at distance)
 
-
-
+// Transmitter setup
 bool setupLoRa(int sck, int miso, int mosi, int cs, int rst, int irq, long frequency = 434E6) {
-  // Create SPI object with custom pins
-  loraSPI = new SPIClass(SPI);  // or HSPI depending on your ESP32 wiring
+  loraSPI = new SPIClass(SPI);
   loraSPI->begin(sck, miso, mosi, cs);
 
-  LoRa.setSpreadingFactor(sf);
-  LoRa.setSignalBandwidth(sbw);
-  LoRa.setCodingRate4(CRC);
-  LoRa.setTxPower(level);
-  LoRa.setPreambleLength(pal);
-
-  // Tell LoRa to use this SPI and our pins
   LoRa.setSPI(*loraSPI);
   LoRa.setPins(cs, rst, irq);
+
+  // Long range tuning
+  LoRa.setSpreadingFactor(12);       // Max range, slower speed
+  LoRa.setSignalBandwidth(62500);    // 62.5 kHz bandwidth
+  LoRa.setCodingRate4(8);            // 4/8 = max reliability
+  LoRa.setTxPower(20);               // 20 dBm = full power
+  LoRa.setPreambleLength(12);        // Longer preamble helps at distance
+  LoRa.enableCrc();                  // Enable CRC
 
   if (!LoRa.begin(frequency)) {
     Serial.println("LoRa init failed!");
     return false;
   }
 
-  Serial.println("LoRa init succeeded.");
+  Serial.println("LoRa init succeeded (TX).");
   return true;
 }
+
 
 void setup() {
   // Pin setups ---------------------------
@@ -201,10 +196,10 @@ void loop() {
 
   BME280::TempUnit tempUnit(BME280::TempUnit_Celsius);
   BME280::PresUnit presUnit(BME280::PresUnit_hPa);
-
+  
   // Only update GPS every _ loops
-  if (loopCounter % 100 == 0) {
-    Status stat = gps.updatePVT(true, 100000);
+  if (loopCounter % 10 == 0) {
+    Status stat = gps.updatePVT(false,10);
     if (stat == Status::NoError) {
         latitude  = gps.pvtData.latitude / 10000000.0;
         longitude = gps.pvtData.longitude / 10000000.0;
