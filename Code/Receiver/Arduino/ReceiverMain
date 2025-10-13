@@ -32,7 +32,6 @@ void setup() {
   Serial.begin(115200);
   while (!Serial);
 
-  // Same pins as your transmitter
   int mySCK  = 7;
   int myMISO = 6;
   int myMOSI = 5;
